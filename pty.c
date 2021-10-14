@@ -8,8 +8,13 @@
 #include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/select.h>
 
+#define BUF_SIZE 256
 #define MAX_SNAME 1000
+
+struct termios ttyOrig;
 
 
 int ptyMasterOpen(char* slaveName, size_t snLen) {
@@ -62,8 +67,8 @@ int ptyMasterOpen(char* slaveName, size_t snLen) {
 }
 
 
-pid_t ptyFork(int* masterFd, char* slaveName, size_t snLen, const struct
-    termios* slaveTermios, const struct winsize* slaveWS) {
+pid_t ptyFork(int* masterFd, char* slaveName, size_t snLen,
+    const struct termios* slaveTermios, const struct winsize* slaveWS) {
 
     int mfd, slaveFd, savedErrno;
     pid_t childPid;
@@ -137,5 +142,73 @@ pid_t ptyFork(int* masterFd, char* slaveName, size_t snLen, const struct
 }
 
 int main() {
+
+    char slaveName[MAX_SNAME];
+    char* shell;
+    int masterFd;
+    struct winsize ws;
+    fd_set inFds;
+    char buf[BUF_SIZE];
+    ssize_t numRead;
+    pid_t childPid;
+
+
+    /* Retrieve the attributes and window size of the terminal under which the */
+    /* program is run */
+    if (tcgetattr(STDIN_FILENO, &ttyOrig) == -1)
+        perror("tcgetattr");
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) < 0)
+        perror("ioctl-TIOCSWINSZ");
+
+    childPid = ptyFork(&masterFd, slaveName, MAX_SNAME, &ttyOrig, &ws);
+    if (childPid == -1)
+        perror("ptyFork");
+
+    /* Execute a shell based on the SHELL env variable */
+    if (childPid == 0) {
+        shell = getenv("SHELL");
+
+        /* The env variable may not be set */
+        if (shell == NULL || *shell == '\0')
+            shell = "/bin/sh";
+
+        execlp(shell, shell, (char*) NULL);
+
+        /* Should't get here unless there's an error */
+        perror("execlp");
+    }
+
+    for (;;) {
+        FD_ZERO(&inFds);
+        FD_SET(STDIN_FILENO, &inFds);
+        FD_SET(masterFd, &inFds);
+
+        if (select(masterFd + 1, &inFds, NULL, NULL, NULL) == -1)
+            perror("select");
+
+        if (FD_ISSET(STDIN_FILENO, &inFds)) {
+            numRead = read(STDIN_FILENO, buf, BUF_SIZE);
+            if (numRead <= 0)
+                exit(EXIT_SUCCESS);
+
+            if (write(masterFd, buf, numRead) != numRead) {
+                perror("FATAL partial/failed write (masterFd)");
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        if (FD_ISSET(masterFd, &inFds)) {
+            numRead = read(masterFd, buf, BUF_SIZE);
+            if (numRead <= 0)
+                exit(EXIT_SUCCESS);
+
+            if (write(STDOUT_FILENO, buf, numRead) != numRead) {
+                perror("FATAL partial/failed write (STDOUT_FILENO)");
+                exit(EXIT_FAILURE);
+            }
+
+        }
+    }
+
     return 0;
 }
